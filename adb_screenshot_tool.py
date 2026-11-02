@@ -17,7 +17,9 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 
 
-APP_TITLE = "ADB设备工具"
+APP_TITLE = "ADB命令可视化工具"
+APP_VERSION = "1.0"
+APP_BRAND = "luya"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
@@ -30,7 +32,7 @@ class AdbScreenshotTool:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(APP_TITLE)
+        self.root.title(f"{APP_BRAND}{APP_VERSION} {APP_TITLE}")
         self.root.geometry("1280x820")
         self.root.minsize(1040, 680)
         self.root.configure(background="#f4f6f8")
@@ -57,6 +59,20 @@ class AdbScreenshotTool:
         self.mirror_process = None
         self.mirror_stop_requested = False
         self.mirror_window_handle = None
+        self.mirror_resize_after_id = None
+        self.mirror_last_size = None
+        self.mirror_serial = None
+        self.mirror_keyboard_queue = queue.Queue()
+        self.mirror_keyboard_thread = None
+        self.mirror_keyboard_shell = None
+        self.mirror_keyboard_shell_serial = None
+        self.mirror_keyboard_shell_lock = threading.Lock()
+        self.mirror_keyboard_text_buffer = []
+        self.mirror_keyboard_text_after_id = None
+        self.mirror_keyboard_text_lock = threading.Lock()
+        self.mirror_native_text_buffer = []
+        self.mirror_native_text_after_id = None
+        self.mirror_keyboard_capture_after_id = None
         self.artifact_paths = {}
         self.performance_state = "idle"
         self.performance_stop_event = None
@@ -71,9 +87,9 @@ class AdbScreenshotTool:
         self.performance_live_phase = ""
         self.performance_ui_after_id = None
 
-        # PyInstaller 的 onefile 运行时 __file__ 位于临时解压目录；产物必须放在 EXE 旁边。
+        # PyInstaller 的 onefile 运行时 __file__ 位于临时解压目录；用户文件统一放在 EXE 旁边。
         self.app_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-        self.output_dir = os.path.join(self.app_dir, "captures")
+        self.output_dir = self.app_dir
 
         default_adb = self.find_adb()
         self.adb_var = tk.StringVar(value=default_adb)
@@ -94,6 +110,7 @@ class AdbScreenshotTool:
         self.status_var = tk.StringVar(value="准备就绪")
 
         self.build_ui()
+        self.load_existing_artifacts()
         self.root.after(100, self.poll_results)
         self.refresh_devices()
         self.root.after(2500, self.auto_refresh_devices)
@@ -141,8 +158,6 @@ class AdbScreenshotTool:
 
         outer = ttk.Frame(self.root, padding=10)
         outer.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(outer, text=APP_TITLE, font=("Microsoft YaHei UI", 14, "bold")).pack(anchor=tk.W)
-        ttk.Label(outer, text="截图使用设备原生能力；投屏窗口支持鼠标和键盘操作。", font=("Microsoft YaHei UI", 9), foreground="#64748b").pack(anchor=tk.W, pady=(0, 5))
 
         workspace = ttk.Frame(outer)
         workspace.pack(fill=tk.BOTH, expand=True)
@@ -215,7 +230,8 @@ class AdbScreenshotTool:
         tool_buttons.pack(fill=tk.X)
         ttk.Button(tool_buttons, text="重启设备", command=self.reboot_device).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(tool_buttons, text="关机设备", command=self.poweroff_device).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(tool_buttons, text="获取当前应用", command=self.get_current_app).pack(side=tk.LEFT, padx=(24, 0))
+        ttk.Button(tool_buttons, text="获取设备详情", command=self.get_device_details).pack(side=tk.LEFT, padx=(24, 0))
+        ttk.Button(tool_buttons, text="获取当前应用", command=self.get_current_app).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(tool_buttons, text="应用详情", command=self.show_package_info).pack(side=tk.LEFT, padx=(8, 0))
         package_row = ttk.Frame(tools)
         package_row.pack(fill=tk.X, pady=(8, 0))
@@ -292,16 +308,30 @@ class AdbScreenshotTool:
         self.operation_view.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.operation_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.operation_view.bind("<Button-3>", self.show_operation_menu)
-        self.device_combo.bind("<<ComboboxSelected>>", lambda _event: self.load_device_info())
+        self.device_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self.load_device_info(),
+        )
 
         preview_frame = ttk.Frame(right, padding=8)
         preview_frame.grid(row=0, column=0, sticky=tk.NSEW)
         self.preview_host = preview_frame
-        self.preview = tk.Label(preview_frame, text="点击“截图”获取设备当前画面\n开始录屏后这里会实时显示设备画面", background="#20252b", foreground="#d9e2ec", font=("Microsoft YaHei UI", 10), justify=tk.CENTER)
+        self.preview = tk.Label(
+            preview_frame,
+            text="点击“截图”获取设备当前画面\n开始录屏后这里会实时显示设备画面",
+            background="#20252b",
+            foreground="#d9e2ec",
+            font=("Microsoft YaHei UI", 10),
+            justify=tk.CENTER,
+        )
         self.preview.pack(fill=tk.BOTH, expand=True)
         self.preview.bind("<Configure>", lambda _event: self.render_preview())
         self.preview.bind("<Button-3>", self.show_image_menu)
-        preview_frame.bind("<Configure>", lambda _event: self.root.after_idle(self.resize_embedded_mirror))
+        self.preview_host.bind("<Button-1>", lambda _event: self.focus_embedded_mirror())
+        preview_frame.bind("<Configure>", lambda _event: self.schedule_mirror_resize())
+        # 最大化/还原时，Tk 先改变顶层窗口，再异步重新布局右侧预览区。
+        # 同时监听顶层窗口，确保 scrcpy 子窗口在布局完成后重新贴合宿主区域。
+        self.root.bind("<Configure>", lambda _event: self.schedule_mirror_resize(), add="+")
         status = ttk.Frame(outer)
         status.pack(fill=tk.X, pady=(8, 0))
         ttk.Label(status, textvariable=self.status_var, foreground="#52606d").pack(side=tk.LEFT)
@@ -437,7 +467,7 @@ class AdbScreenshotTool:
                     raise RuntimeError(self.command_error(result, "截图命令执行失败"))
                 image = Image.open(io.BytesIO(result.stdout)).convert("RGB")
                 image.load()
-                # 每次点击“截图”都自动保存到 captures，并加入文件列表；
+                # 每次点击“截图”都自动保存到 EXE 同目录，并加入文件列表；
                 # 投屏时仍不刷新右侧预览，避免打断正在显示的投屏画面。
                 os.makedirs(self.output_dir, exist_ok=True)
                 stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
@@ -560,7 +590,10 @@ class AdbScreenshotTool:
 
     def start_mirroring(self):
         serial = self.selected_serial()
-        if not serial or self.mirror_process is not None:
+        if not serial:
+            return
+        if self.mirror_process is not None:
+            self.status_var.set("投屏已在运行中")
             return
         scrcpy = self.scrcpy_path
         if not scrcpy or not os.path.isfile(scrcpy):
@@ -576,6 +609,9 @@ class AdbScreenshotTool:
                 raise RuntimeError("找不到 scrcpy-server")
             # scrcpy 3.x 通过环境变量指定 server，旧版的 --server 参数会导致直接退出。
             environment["SCRCPY_SERVER_PATH"] = server_path
+            self.mirror_stop_requested = False
+            self.mirror_serial = serial
+            self.mirror_window_handle = None
             self.preview_host.update_idletasks()
             initial_width, initial_height = self.get_preview_host_size()
             command = [
@@ -587,9 +623,15 @@ class AdbScreenshotTool:
                 f"--window-height={max(240, initial_height)}",
                 "--window-title",
                 f"ADB 投屏 - {serial}",
+                # 当前电脑可能没有可用的 WASAPI 音频端点；工具只需要画面和控制，
+                # 关闭音频可避免 scrcpy 因音频初始化失败而退出整个投屏会话。
+                "--no-audio",
+                # 使用 scrcpy 原生 SDK 键盘通道。部分手机 ROM 对 UHID 物理键盘
+                # 事件处理不兼容，可能触发系统输入法或桌面进程崩溃；SDK 通道兼容性更好。
+                # 这里不再叠加 Tk/ADB 自定义转发，因此不会产生重复、反序或额外延迟。
+                "--keyboard=sdk",
             ]
-            self.mirror_stop_requested = False
-            self.mirror_process = subprocess.Popen(
+            process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -597,15 +639,21 @@ class AdbScreenshotTool:
                 env=environment,
                 cwd=os.path.dirname(scrcpy),
             )
+            self.mirror_process = process
+            threading.Thread(target=self.watch_mirror_process, args=(process,), daemon=True).start()
         except Exception as exc:
+            if 'process' in locals() and process.poll() is None:
+                process.terminate()
             self.mirror_process = None
+            self.mirror_serial = None
+            self.stop_mirror_keyboard_capture()
+            self.mirror_window_handle = None
             self.mirror_button.configure(text="开始投屏并控制", state=tk.NORMAL)
             self.status_var.set("投屏启动失败")
             self.set_operation_text(str(exc), "投屏失败")
             return
         self.mirror_button.configure(text="正在启动投屏…", state=tk.DISABLED)
-        self.status_var.set("正在启动投屏并嵌入右侧预览区…")
-        threading.Thread(target=self.watch_mirror_process, args=(self.mirror_process,), daemon=True).start()
+        self.status_var.set(f"正在启动设备 {serial} 投屏并嵌入右侧预览区…")
 
     def toggle_mirroring(self):
         if self.mirror_process is not None:
@@ -650,7 +698,7 @@ class AdbScreenshotTool:
         return None
 
     def embed_mirror_window(self, process, hwnd):
-        """把 scrcpy 的无边框窗口改成右侧预览框的子窗口。"""
+        """把 scrcpy 无边框窗口嵌入右侧预览框。"""
         if process is not self.mirror_process or sys.platform != "win32":
             return
         user32 = ctypes.windll.user32
@@ -664,6 +712,7 @@ class AdbScreenshotTool:
         ws_minimizebox = 0x00020000
         ws_maximizebox = 0x00010000
         ws_sysmenu = 0x00080000
+        ws_tabstop = 0x00010000
         user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
         user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
         user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
@@ -677,7 +726,7 @@ class AdbScreenshotTool:
         user32.SetFocus.argtypes = [wintypes.HWND]
         user32.SetFocus.restype = wintypes.HWND
         style = int(user32.GetWindowLongPtrW(child_hwnd, gwl_style))
-        style = (style & ~(ws_popup | ws_caption | ws_thickframe | ws_minimizebox | ws_maximizebox | ws_sysmenu)) | ws_child
+        style = (style & ~(ws_popup | ws_caption | ws_thickframe | ws_minimizebox | ws_maximizebox | ws_sysmenu)) | ws_child | ws_tabstop
         user32.SetWindowLongPtrW(child_hwnd, gwl_style, ctypes.c_void_p(style))
         if not user32.SetParent(child_hwnd, host_hwnd):
             raise RuntimeError("无法把投屏窗口嵌入预览区域")
@@ -685,13 +734,447 @@ class AdbScreenshotTool:
         self.preview.pack_forget()
         self.resize_embedded_mirror()
         user32.ShowWindow(child_hwnd, 5)
-        user32.SetFocus(child_hwnd)
-        self.status_var.set("投屏已嵌入右侧预览区：可直接用鼠标和键盘控制设备")
+        self.focus_embedded_mirror(int(hwnd))
+        self.root.after(120, lambda: self.focus_embedded_mirror(int(hwnd)))
+        self.status_var.set("投屏已嵌入右侧预览区：点击屏幕即可控制设备")
 
-    def get_preview_host_size(self):
+    def focus_embedded_mirror(self, hwnd_value=None):
+        """将键盘焦点可靠地交给跨进程嵌入的 scrcpy 窗口。"""
+        if hwnd_value is None:
+            hwnd_value = self.mirror_window_handle
+        if not hwnd_value or sys.platform != "win32":
+            return False
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            hwnd = wintypes.HWND(hwnd_value)
+            user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            user32.SetFocus.argtypes = [wintypes.HWND]
+            user32.SetFocus.restype = wintypes.HWND
+            user32.SetActiveWindow.argtypes = [wintypes.HWND]
+            user32.SetActiveWindow.restype = wintypes.HWND
+            user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            user32.SetForegroundWindow.restype = wintypes.BOOL
+            user32.BringWindowToTop.argtypes = [wintypes.HWND]
+            user32.BringWindowToTop.restype = wintypes.BOOL
+            user32.GetFocus.argtypes = []
+            user32.GetFocus.restype = wintypes.HWND
+            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.GetAncestor.restype = wintypes.HWND
+            user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+            user32.AttachThreadInput.restype = wintypes.BOOL
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+            target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+            current_thread = kernel32.GetCurrentThreadId()
+            root_window = user32.GetAncestor(hwnd, 2) or wintypes.HWND(self.root.winfo_id())
+            attached = False
+            if target_thread and target_thread != current_thread:
+                attached = bool(user32.AttachThreadInput(current_thread, target_thread, True))
+            try:
+                # 经过 SetParent 后 scrcpy 已是子窗口，ForegroundWindow 必须设置为宿主顶层窗口。
+                user32.SetForegroundWindow(root_window)
+                user32.BringWindowToTop(hwnd)
+                user32.SetActiveWindow(root_window)
+                user32.SetFocus(hwnd)
+                focused = user32.GetFocus() == hwnd
+            finally:
+                if attached:
+                    user32.AttachThreadInput(current_thread, target_thread, False)
+            return bool(focused)
+        except Exception:
+            # 焦点设置失败不应影响投屏本身，用户点击投屏区域时仍可恢复焦点。
+            return False
+
+    def send_native_keyboard_to_mirror(self, event, key_up=False):
+        """保留兼容入口，但不再用 SendInput 注入文本。
+
+        SendInput 会把事件重新投递到宿主窗口；嵌入 scrcpy 时它与 SDL/ADB
+        通道竞争，连续文本会出现反序或丢字。实际转发统一由
+        ``post_keyboard_message_to_mirror`` 完成。
+        """
+        return False
+
+    def flush_native_keyboard_text(self):
+        self.mirror_native_text_after_id = None
+        if not self.mirror_native_text_buffer:
+            return
+        text = "".join(self.mirror_native_text_buffer)
+        self.mirror_native_text_buffer = []
+        if not self.focus_embedded_mirror():
+            if self.mirror_serial:
+                self.enqueue_mirror_adb_text(text)
+            return
+        code_units = []
+        encoded = text.encode("utf-16-le", "surrogatepass")
+        for index in range(0, len(encoded), 2):
+            code_units.append(int.from_bytes(encoded[index:index + 2], "little"))
+        key_flags = 0x0004  # KEYEVENTF_UNICODE
+        key_up_flags = key_flags | 0x0002  # KEYEVENTF_KEYUP
+        inputs = []
+        for code_unit in code_units:
+            inputs.extend([(0, code_unit, key_flags), (0, code_unit, key_up_flags)])
+        self._send_keyboard_inputs(inputs)
+
+    @staticmethod
+    def _send_keyboard_inputs(items):
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("ki", KEYBDINPUT)]
+
+        inputs = (INPUT * len(items))()
+        for index, (virtual_key, scan_code, flags) in enumerate(items):
+            inputs[index].type = 1  # INPUT_KEYBOARD
+            inputs[index].ki = KEYBDINPUT(virtual_key, scan_code, flags, 0, 0)
+        user32 = ctypes.windll.user32
+        user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+        user32.SendInput.restype = wintypes.UINT
+        return int(user32.SendInput(len(inputs), inputs, ctypes.sizeof(INPUT))) == len(inputs)
+
+    def _keyboard_forward_target(self):
+        """当嵌入窗口没有拿到 Windows 键盘焦点时，返回 scrcpy 窗口作为兜底目标。"""
+        if sys.platform != "win32" or not self.mirror_window_handle:
+            return None
+        if self.mirror_serial:
+            return wintypes.HWND(self.mirror_window_handle)
+        try:
+            focus = self.root.focus_get()
+        except Exception:
+            focus = None
+        # 输入框、文本框等 Tk 控件自己有焦点时，不抢走用户正在编辑的内容。
+        if focus is not None and focus not in (self.root, self.preview_host, self.preview):
+            return None
+        return wintypes.HWND(self.mirror_window_handle)
+
+    @staticmethod
+    def _post_key_message(hwnd, message, virtual_key, lparam):
+        if not hwnd or not virtual_key:
+            return False
+        user32 = ctypes.windll.user32
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostMessageW.restype = wintypes.BOOL
+        return bool(user32.PostMessageW(hwnd, message, int(virtual_key), int(lparam)))
+
+    def post_keyboard_message_to_mirror(self, hwnd, event, key_up=False):
+        """把 Tk 收到的一个键盘事件按原顺序投递给 scrcpy/SDL。
+
+        嵌入 scrcpy 后不能再用 ``SendInput``：它会重新经过 Windows 焦点路由，
+        与宿主 Tk 的绑定和 ADB 兜底交错。直接投递 WM_KEY* / WM_CHAR 到 scrcpy
+        窗口消息队列，可以保持每个字符的顺序，也支持中文 UTF-16 code unit。
+        """
+        if sys.platform != "win32" or not hwnd:
+            return False
+        virtual_key = int(getattr(event, "keycode", 0) or 0)
+        if not virtual_key:
+            return False
+        user32 = ctypes.windll.user32
+        user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        user32.MapVirtualKeyW.restype = wintypes.UINT
+        scan_code = int(user32.MapVirtualKeyW(virtual_key, 0))
+        if key_up:
+            lparam = 1 | (scan_code << 16) | 0xC0000000
+            return self._post_key_message(hwnd, 0x0101, virtual_key, lparam)
+
+        lparam = 1 | (scan_code << 16)
+        posted = self._post_key_message(hwnd, 0x0100, virtual_key, lparam)
+        char = getattr(event, "char", "") or ""
+        if char and char not in ("\x00", "\x08"):
+            try:
+                encoded = char.encode("utf-16-le", "surrogatepass")
+                for index in range(0, len(encoded), 2):
+                    code_unit = int.from_bytes(encoded[index:index + 2], "little")
+                    posted = self._post_key_message(hwnd, 0x0102, code_unit, lparam) and posted
+            except (UnicodeEncodeError, ValueError):
+                pass
+        return bool(posted)
+
+    def forward_keyboard_to_mirror(self, event):
+        """向 scrcpy 子窗口补发 Tk 收到的键盘消息，兼容嵌入窗口焦点失效的情况。"""
+        hwnd = self._keyboard_forward_target()
+        if hwnd is None:
+            return None
+        virtual_key = int(getattr(event, "keycode", 0) or 0)
+        if not virtual_key:
+            return None
+        char = getattr(event, "char", "") or ""
+        if self.mirror_serial:
+            # 只向 scrcpy 的消息队列投递一次，避免 SendInput、scrcpy 原生
+            # 和 ADB 兜底同时注入导致文本顺序反转。
+            if self.post_keyboard_message_to_mirror(hwnd, event, key_up=False):
+                return "break"
+            # 只有 Windows 消息投递失败时才使用 ADB 兜底。
+            if char and char not in ("\x00", "\x08", "\r", "\n", "\t") and char.isprintable():
+                self.enqueue_mirror_adb_text(char)
+            else:
+                self.flush_mirror_keyboard_text()
+                key_name = self.android_key_name(event)
+                if key_name:
+                    self.enqueue_mirror_adb_input(["keyevent", key_name])
+            return "break"
+        user32 = ctypes.windll.user32
+        user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        user32.MapVirtualKeyW.restype = wintypes.UINT
+        scan_code = int(user32.MapVirtualKeyW(virtual_key, 0))
+        lparam = 1 | (scan_code << 16)
+        self._post_key_message(hwnd, 0x0100, virtual_key, lparam)  # WM_KEYDOWN
+        if char and char not in ("\x00", "\x08"):
+            # WM_CHAR 使用 UTF-16 code units；这样中文和组合字符也能交给 SDL 文本输入。
+            encoded = char.encode("utf-16-le", "surrogatepass")
+            for index in range(0, len(encoded), 2):
+                code_unit = int.from_bytes(encoded[index:index + 2], "little")
+                self._post_key_message(hwnd, 0x0102, code_unit, lparam)  # WM_CHAR
+        return "break"
+
+    def forward_keyboard_release_to_mirror(self, event):
+        hwnd = self._keyboard_forward_target()
+        if hwnd is None:
+            return None
+        if self.mirror_serial:
+            if self.post_keyboard_message_to_mirror(hwnd, event, key_up=True):
+                return "break"
+            return "break"
+        virtual_key = int(getattr(event, "keycode", 0) or 0)
+        if not virtual_key:
+            return None
+        user32 = ctypes.windll.user32
+        user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        user32.MapVirtualKeyW.restype = wintypes.UINT
+        scan_code = int(user32.MapVirtualKeyW(virtual_key, 0))
+        lparam = 1 | (scan_code << 16) | 0xC0000000
+        self._post_key_message(hwnd, 0x0101, virtual_key, lparam)  # WM_KEYUP
+        return "break"
+
+    @staticmethod
+    def encode_adb_input_text(text):
+        """编码 adb shell input text 的空格和百分号语法。"""
+        return text.replace("%", r"\%").replace(" ", "%s")
+
+    @staticmethod
+    def android_key_name(event):
+        keysym = str(getattr(event, "keysym", "") or "")
+        if len(keysym) == 1 and keysym.isalpha():
+            return keysym.upper()
+        if len(keysym) == 1 and keysym.isdigit():
+            return keysym
+        names = {
+            "BackSpace": "DEL",
+            "Delete": "FORWARD_DEL",
+            "Return": "ENTER",
+            "KP_Enter": "ENTER",
+            "Escape": "ESCAPE",
+            "Tab": "TAB",
+            "space": "SPACE",
+            "Left": "DPAD_LEFT",
+            "Right": "DPAD_RIGHT",
+            "Up": "DPAD_UP",
+            "Down": "DPAD_DOWN",
+            "Home": "MOVE_HOME",
+            "End": "MOVE_END",
+            "Prior": "PAGE_UP",
+            "Next": "PAGE_DOWN",
+            "Insert": "INSERT",
+            "Shift_L": "SHIFT_LEFT",
+            "Shift_R": "SHIFT_RIGHT",
+            "Control_L": "CTRL_LEFT",
+            "Control_R": "CTRL_RIGHT",
+            "Alt_L": "ALT_LEFT",
+            "Alt_R": "ALT_RIGHT",
+            "Caps_Lock": "CAPS_LOCK",
+            "F1": "F1",
+            "F2": "F2",
+            "F3": "F3",
+            "F4": "F4",
+            "F5": "F5",
+            "F6": "F6",
+            "F7": "F7",
+            "F8": "F8",
+            "F9": "F9",
+            "F10": "F10",
+            "F11": "F11",
+            "F12": "F12",
+        }
+        return names.get(keysym)
+
+    def enqueue_mirror_adb_input(self, args):
+        serial = self.mirror_serial
+        if not serial:
+            return
+        self.mirror_keyboard_queue.put((serial, list(args)))
+        if self.mirror_keyboard_thread is None or not self.mirror_keyboard_thread.is_alive():
+            self.mirror_keyboard_thread = threading.Thread(
+                target=self.mirror_keyboard_worker,
+                daemon=True,
+            )
+            self.mirror_keyboard_thread.start()
+
+    def enqueue_mirror_adb_text(self, text):
+        """短暂合并连续文字，避免每个字符都触发一次设备端 input 命令。"""
+        serial = self.mirror_serial
+        if not serial or not text:
+            return
+        with self.mirror_keyboard_text_lock:
+            self.mirror_keyboard_text_buffer.append(text)
+            if self.mirror_keyboard_text_after_id is None:
+                # Android input 处理是异步的，稍微合并一小段连续文本可避免后来的字符插到前面。
+                self.mirror_keyboard_text_after_id = self.root.after(60, self.flush_mirror_keyboard_text)
+
+    def flush_mirror_keyboard_text(self):
+        with self.mirror_keyboard_text_lock:
+            self.mirror_keyboard_text_after_id = None
+            if not self.mirror_keyboard_text_buffer:
+                return
+            text = "".join(self.mirror_keyboard_text_buffer)
+            self.mirror_keyboard_text_buffer = []
+        serial = self.mirror_serial
+        if serial and text:
+            self.mirror_keyboard_queue.put((serial, ["text", self.encode_adb_input_text(text)]))
+
+    @staticmethod
+    def _adb_shell_quote(value):
+        """为持久 adb shell 的单行命令做最小安全引用。"""
+        return "'" + str(value).replace("'", "'\\''") + "'"
+
+    def open_mirror_keyboard_shell(self, serial):
+        shell = self.mirror_keyboard_shell
+        if shell is not None and shell.poll() is None and self.mirror_keyboard_shell_serial == serial:
+            return shell
+        self.close_mirror_keyboard_shell()
+        try:
+            adb = self.adb_var.get().strip().strip('"')
+            shell = subprocess.Popen(
+                [adb, "-s", serial, "shell", "-T"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+            )
+            self.mirror_keyboard_shell = shell
+            self.mirror_keyboard_shell_serial = serial
+            return shell
+        except Exception:
+            self.mirror_keyboard_shell = None
+            self.mirror_keyboard_shell_serial = None
+            return None
+
+    def write_mirror_keyboard_command(self, shell, args):
+        if not shell or shell.poll() is not None or not args:
+            return False
+        if args[0] == "text" and len(args) >= 2:
+            command = "input text " + self._adb_shell_quote(args[1])
+        else:
+            command = "input " + " ".join(self._adb_shell_quote(item) for item in args)
+        try:
+            shell.stdin.write((command + "\n").encode("utf-8"))
+            shell.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError, AttributeError):
+            return False
+
+    def mirror_keyboard_worker(self):
+        if self.mirror_serial:
+            self.open_mirror_keyboard_shell(self.mirror_serial)
+        while True:
+            try:
+                serial, args = self.mirror_keyboard_queue.get(timeout=0.5)
+            except queue.Empty:
+                if not self.mirror_serial:
+                    self.close_mirror_keyboard_shell()
+                    return
+                continue
+            try:
+                if serial != self.mirror_serial:
+                    continue
+                shell = self.open_mirror_keyboard_shell(serial)
+                if not self.write_mirror_keyboard_command(shell, args):
+                    self.close_mirror_keyboard_shell()
+                    shell = self.open_mirror_keyboard_shell(serial)
+                    self.write_mirror_keyboard_command(shell, args)
+            except Exception:
+                # 键盘兜底失败不打断投屏，scrcpy 原生通道仍可继续使用。
+                pass
+            finally:
+                self.mirror_keyboard_queue.task_done()
+
+    def close_mirror_keyboard_shell(self):
+        shell = self.mirror_keyboard_shell
+        self.mirror_keyboard_shell = None
+        self.mirror_keyboard_shell_serial = None
+        if shell is None:
+            return
+        try:
+            if shell.stdin:
+                shell.stdin.close()
+        except Exception:
+            pass
+        try:
+            if shell.poll() is None:
+                shell.terminate()
+                shell.wait(timeout=1)
+        except Exception:
+            try:
+                shell.kill()
+            except Exception:
+                pass
+
+    def start_mirror_keyboard_capture(self):
+        """启动投屏后的键盘兼容逻辑。
+
+        scrcpy 子窗口必须保留真正的 Windows 焦点，才能让 SDL 原生键盘
+        通道按顺序处理按键；旧实现定时把焦点抢回 Tk，导致反序和丢字。
+        Tk 的全局绑定仍会在焦点异常时调用消息投递兜底，但这里不再抢焦点。
+        """
+        self.stop_mirror_keyboard_capture()
+        if self.mirror_serial and (self.mirror_keyboard_thread is None or not self.mirror_keyboard_thread.is_alive()):
+            self.mirror_keyboard_thread = threading.Thread(
+                target=self.mirror_keyboard_worker,
+                daemon=True,
+            )
+            self.mirror_keyboard_thread.start()
+
+    def keep_mirror_keyboard_capture(self):
+        # 兼容旧调用方；不再用定时器把焦点从 scrcpy 子窗口抢回 Tk。
+        self.mirror_keyboard_capture_after_id = None
+
+    def stop_mirror_keyboard_capture(self):
+        after_id = self.mirror_keyboard_capture_after_id
+        self.mirror_keyboard_capture_after_id = None
+        if after_id:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        text_after_id = self.mirror_keyboard_text_after_id
+        self.mirror_keyboard_text_after_id = None
+        if text_after_id:
+            try:
+                self.root.after_cancel(text_after_id)
+            except Exception:
+                pass
+        with self.mirror_keyboard_text_lock:
+            self.mirror_keyboard_text_buffer = []
+        native_after_id = self.mirror_native_text_after_id
+        self.mirror_native_text_after_id = None
+        if native_after_id:
+            try:
+                self.root.after_cancel(native_after_id)
+            except Exception:
+                pass
+        self.mirror_native_text_buffer = []
+        self.close_mirror_keyboard_shell()
+
+    def get_preview_host_size(self, host=None):
         """读取预览容器的原生客户区尺寸，避免 DPI 缩放导致投屏只占一半。"""
-        width = max(1, self.preview_host.winfo_width())
-        height = max(1, self.preview_host.winfo_height())
+        host = host or self.preview_host
+        width = max(1, host.winfo_width())
+        height = max(1, host.winfo_height())
         if sys.platform != "win32":
             return width, height
         try:
@@ -701,12 +1184,27 @@ class AdbScreenshotTool:
             user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
             user32.GetClientRect.restype = wintypes.BOOL
             rect = RECT()
-            if user32.GetClientRect(wintypes.HWND(self.preview_host.winfo_id()), ctypes.byref(rect)):
+            if user32.GetClientRect(wintypes.HWND(host.winfo_id()), ctypes.byref(rect)):
                 width = max(1, int(rect.right - rect.left))
                 height = max(1, int(rect.bottom - rect.top))
         except Exception:
             pass
         return width, height
+
+    def schedule_mirror_resize(self, delay=40):
+        """在窗口完成布局后调整嵌入的 scrcpy 窗口。"""
+        if not self.mirror_window_handle or sys.platform != "win32":
+            return
+        if self.mirror_resize_after_id:
+            try:
+                self.root.after_cancel(self.mirror_resize_after_id)
+            except Exception:
+                pass
+        self.mirror_resize_after_id = self.root.after(delay, self._scheduled_mirror_resize)
+
+    def _scheduled_mirror_resize(self):
+        self.mirror_resize_after_id = None
+        self.resize_embedded_mirror()
 
     def resize_embedded_mirror(self):
         if not self.mirror_window_handle or sys.platform != "win32":
@@ -715,9 +1213,19 @@ class AdbScreenshotTool:
             user32 = ctypes.windll.user32
             user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
             user32.SetWindowPos.restype = wintypes.BOOL
+            user32.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL]
+            user32.MoveWindow.restype = wintypes.BOOL
             width, height = self.get_preview_host_size()
-            # SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW
-            user32.SetWindowPos(wintypes.HWND(self.mirror_window_handle), None, 0, 0, width, height, 0x0004 | 0x0010 | 0x0040)
+            if width <= 1 or height <= 1:
+                self.schedule_mirror_resize(100)
+                return
+            hwnd = wintypes.HWND(self.mirror_window_handle)
+            # MoveWindow 会向 SDL 窗口发送完整的尺寸变化消息，避免 scrcpy
+            # 继续使用启动投屏时的固定渲染尺寸。
+            user32.MoveWindow(hwnd, 0, 0, width, height, True)
+            # SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED
+            user32.SetWindowPos(hwnd, None, 0, 0, width, height, 0x0004 | 0x0010 | 0x0040 | 0x0020)
+            self.mirror_last_size = (width, height)
         except Exception:
             pass
 
@@ -725,10 +1233,22 @@ class AdbScreenshotTool:
         """清空右侧预览缓存，避免录屏/投屏结束后继续显示旧画面。"""
         self.image = None
         self.preview_photo = None
-        self.preview.configure(image="", text="点击“截图”获取设备当前画面\n开始录屏后这里会实时显示设备画面")
+        self.preview.configure(
+            image="",
+            text="点击“截图”获取设备当前画面\n开始录屏后这里会实时显示设备画面",
+        )
 
     def restore_preview_after_mirror(self):
+        self.mirror_serial = None
+        self.stop_mirror_keyboard_capture()
+        if self.mirror_resize_after_id:
+            try:
+                self.root.after_cancel(self.mirror_resize_after_id)
+            except Exception:
+                pass
+            self.mirror_resize_after_id = None
         self.mirror_window_handle = None
+        self.mirror_last_size = None
         if self.preview.winfo_manager() != "pack":
             self.preview.pack(fill=tk.BOTH, expand=True)
         self.clear_preview()
@@ -745,24 +1265,26 @@ class AdbScreenshotTool:
         self.result_queue.put(("mirror_closed", (process, process.returncode, output), None))
 
     def stop_mirroring(self):
-        if self.mirror_process is not None:
-            self.mirror_stop_requested = True
-            self.mirror_button.configure(text="正在关闭投屏…", state=tk.DISABLED)
+        if self.mirror_process is None:
+            return
+        self.mirror_stop_requested = True
+        self.mirror_button.configure(text="正在关闭投屏…", state=tk.DISABLED)
+        if self.mirror_process.poll() is None:
             self.mirror_process.terminate()
-            self.status_var.set("正在关闭投屏…")
+        self.status_var.set("正在关闭投屏…")
 
     def load_device_info(self):
         """自动读取当前选择设备的信息，并显示在底部的当前操作区域。"""
         display = self.device_var.get().strip()
         if not display:
-            self.set_operation_text("设备信息（当前选择的）\n\n暂无在线设备。")
+            self.set_operation_text("设备摘要（自动读取）\n\n暂无在线设备。")
             return
         record = self.device_state_map.get(display)
         if record:
             serial, state = record
             if state != "device":
                 hint = "请在手机上确认“允许 USB 调试”，确认后点击刷新设备。" if state == "unauthorized" else "请检查设备连接后点击刷新设备。"
-                self.set_operation_text(f"设备：{serial}\n状态：{state}\n\n{hint}", "设备信息（当前选择的）")
+                self.set_operation_text(f"设备：{serial}\n状态：{state}\n\n{hint}", "设备摘要（自动读取）")
                 return
         else:
             serial = display
@@ -775,7 +1297,7 @@ class AdbScreenshotTool:
                     lines.append(f"{label}: {result.stdout.decode('utf-8', 'replace').strip()}")
                 size = self.run_adb(["-s", serial, "shell", "wm", "size"], timeout=10)
                 lines.append(size.stdout.decode("utf-8", "replace").strip())
-                self.result_queue.put(("text", ("设备信息（当前选择的）", "\n".join(lines)), None))
+                self.result_queue.put(("text", ("设备摘要（自动读取）", "\n".join(lines)), None))
             except Exception as exc:
                 self.result_queue.put(("operation_error", "设备信息读取失败", str(exc)))
         self.start_worker("正在读取当前设备信息…", worker)
@@ -1236,6 +1758,109 @@ class AdbScreenshotTool:
                 self.result_queue.put(("error", None, str(exc)))
         self.start_worker("正在获取当前应用…", worker)
 
+    def get_device_details(self):
+        """读取整台设备的系统详情，不依赖当前前台应用。"""
+        serial = self.selected_serial()
+        if not serial:
+            return
+
+        self.set_operation_text("正在读取整台设备详情，请稍候…", "设备详情")
+
+        def worker():
+            try:
+                prop_result = self.run_adb(["-s", serial, "shell", "getprop"], timeout=15)
+                if prop_result.returncode != 0:
+                    raise RuntimeError(self.command_error(prop_result, "读取设备属性失败"))
+                props = {}
+                for line in prop_result.stdout.decode("utf-8", "replace").splitlines():
+                    match = re.match(r"\[([^]]+)\]: \[([^]]*)\]", line.strip())
+                    if match:
+                        props[match.group(1)] = match.group(2)
+
+                def prop(key, fallback="未知"):
+                    value = props.get(key, "").strip()
+                    return value or fallback
+
+                lines = [
+                    f"序列号：{serial}",
+                    "",
+                    "【设备信息】",
+                    f"厂商：{prop('ro.product.manufacturer')}",
+                    f"品牌：{prop('ro.product.brand')}",
+                    f"型号：{prop('ro.product.model')}",
+                    f"设备代号：{prop('ro.product.device')}",
+                    f"产品：{prop('ro.product.name')}",
+                    "",
+                    "【Android 系统】",
+                    f"Android 版本：{prop('ro.build.version.release')}",
+                    f"SDK：{prop('ro.build.version.sdk')}",
+                    f"系统版本号：{prop('ro.build.display.id')}",
+                    f"安全补丁：{prop('ro.build.version.security_patch')}",
+                    f"系统 ABI：{prop('ro.product.cpu.abilist')}",
+                    f"系统指纹：{prop('ro.build.fingerprint')}",
+                ]
+
+                commands = [
+                    ("【屏幕】", ["shell", "wm", "size"]),
+                    ("【屏幕密度】", ["shell", "wm", "density"]),
+                    ("【运行时间】", ["shell", "uptime"]),
+                    ("【内存】", ["shell", "cat", "/proc/meminfo"]),
+                    ("【存储】", ["shell", "df", "-h", "/data"]),
+                    ("【电池】", ["shell", "dumpsys", "battery"]),
+                ]
+                for heading, args in commands:
+                    result = self.run_adb(["-s", serial] + args, timeout=15)
+                    if result.returncode != 0:
+                        continue
+                    raw = result.stdout.decode("utf-8", "replace").strip()
+                    if heading == "【内存】":
+                        memory = {}
+                        for key in ("MemTotal", "MemAvailable"):
+                            match = re.search(rf"^{key}:\s+(\d+)\s+kB", raw, re.MULTILINE)
+                            if match:
+                                memory[key] = f"{int(match.group(1)) / 1024:.0f} MB"
+                        value = "；".join(
+                            f"{label}：{memory[key]}" for label, key in (("总内存", "MemTotal"), ("可用内存", "MemAvailable")) if key in memory
+                        )
+                        if value:
+                            lines.extend(["", heading, value])
+                    elif heading == "【电池】":
+                        values = {}
+                        for key in ("status", "health", "level", "temperature", "voltage"):
+                            match = re.search(rf"^\s*{key}:\s*(.+)$", raw, re.MULTILINE | re.IGNORECASE)
+                            if match:
+                                values[key] = match.group(1).strip()
+                        battery = []
+                        if "level" in values:
+                            battery.append(f"电量：{values['level']}%")
+                        if "status" in values:
+                            status_names = {1: "未知", 2: "充电中", 3: "放电中", 4: "未充电", 5: "已充满"}
+                            try:
+                                battery.append(f"状态：{status_names.get(int(values['status']), values['status'])}")
+                            except ValueError:
+                                battery.append(f"状态：{values['status']}")
+                        if "temperature" in values:
+                            try:
+                                battery.append(f"温度：{int(values['temperature']) / 10:.1f}℃")
+                            except ValueError:
+                                pass
+                        if "voltage" in values:
+                            try:
+                                battery.append(f"电压：{int(values['voltage']) / 1000:.2f}V")
+                            except ValueError:
+                                pass
+                        if battery:
+                            lines.extend(["", heading, "；".join(battery)])
+                    else:
+                        if raw:
+                            lines.extend(["", heading, raw])
+
+                self.result_queue.put(("text", ("设备详情", "\n".join(lines)), None))
+            except Exception as exc:
+                self.result_queue.put(("operation_error", "设备详情读取失败", str(exc)))
+
+        self.start_worker("正在读取整台设备详情…", worker)
+
     def show_package_info(self):
         serial, package = self.selected_serial(), self.package_var.get().strip()
         if not serial or not package:
@@ -1477,12 +2102,13 @@ class AdbScreenshotTool:
     def render_preview(self):
         if self.image is None:
             return
-        width, height = max(80, self.preview.winfo_width() - 18), max(80, self.preview.winfo_height() - 18)
+        target = self.preview
+        width, height = max(80, target.winfo_width() - 18), max(80, target.winfo_height() - 18)
         scale = min(width / self.image.width, height / self.image.height, 1.0)
         size = (max(1, int(self.image.width * scale)), max(1, int(self.image.height * scale)))
         displayed = self.image.resize(size, Image.Resampling.LANCZOS) if size != self.image.size else self.image
         self.preview_photo = ImageTk.PhotoImage(displayed)
-        self.preview.configure(image=self.preview_photo, text="")
+        target.configure(image=self.preview_photo, text="")
 
     def save_image(self):
         if self.image is None:
@@ -1500,6 +2126,59 @@ class AdbScreenshotTool:
         # 文件列表按创建顺序倒序排列，最新截图/录屏/报告始终置顶。
         item = self.artifact_tree.insert("", 0, values=(kind, os.path.basename(path)))
         self.artifact_paths[item] = path
+
+    @staticmethod
+    def artifact_kind(path):
+        """根据文件名判断历史文件在列表中的类型。"""
+        name = os.path.basename(path).lower()
+        if name.startswith("screen-shot-") and name.endswith((".png", ".jpg", ".jpeg")):
+            return "截图"
+        if name.startswith("screen-record-") and name.endswith(".mp4"):
+            return "录屏"
+        if name.startswith("performance-") and name.endswith((".txt", ".log")):
+            return "性能报告"
+        if name.startswith("logcat-") and name.endswith(".log"):
+            return "日志"
+        return None
+
+    def load_existing_artifacts(self):
+        """启动时恢复 EXE 目录中已有的截图、录屏、报告和日志。"""
+        if not hasattr(self, "artifact_tree"):
+            return
+        folders = [self.output_dir]
+        # 兼容此前版本写入的 captures 子目录，升级后仍能看到历史文件。
+        legacy_folder = os.path.join(self.app_dir, "captures")
+        if os.path.normcase(legacy_folder) != os.path.normcase(self.output_dir):
+            folders.append(legacy_folder)
+        records = []
+        seen = set()
+        for folder in folders:
+            if not os.path.isdir(folder):
+                continue
+            try:
+                entries = os.scandir(folder)
+            except OSError:
+                continue
+            with entries:
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    path = os.path.abspath(entry.path)
+                    key = os.path.normcase(path)
+                    if key in seen:
+                        continue
+                    kind = self.artifact_kind(path)
+                    if not kind:
+                        continue
+                    try:
+                        modified = entry.stat().st_mtime
+                    except OSError:
+                        modified = 0
+                    seen.add(key)
+                    records.append((modified, kind, path))
+        # add_artifact 总是插入首行，因此按旧到新加载，最终最新文件位于最前。
+        for _modified, kind, path in sorted(records, key=lambda item: item[0]):
+            self.add_artifact(kind, path)
 
     def show_image_menu(self, event):
         menu = tk.Menu(self.root, tearoff=False)
@@ -1844,9 +2523,10 @@ class AdbScreenshotTool:
                             self.status_var.set("投屏嵌入失败")
                             self.mirror_button.configure(text="正在关闭投屏…", state=tk.DISABLED)
                             self.mirror_stop_requested = True
-                            process.terminate()
+                            if process.poll() is None:
+                                process.terminate()
                 elif kind == "mirror_closed":
-                    process, returncode, output = value if isinstance(value, tuple) else (value, 0, "")
+                    process, returncode, output = value if isinstance(value, tuple) and len(value) >= 3 else (value, 0, "")
                     if process is self.mirror_process:
                         self.mirror_process = None
                         self.restore_preview_after_mirror()

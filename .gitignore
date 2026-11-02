@@ -3,6 +3,10 @@ __pycache__/
 .venv/
 venv/
 captures/
+screen-shot-*
+screen-record-*
+performance-*.txt
+logcat-*.log
 build/
 dist/
 build_*/
